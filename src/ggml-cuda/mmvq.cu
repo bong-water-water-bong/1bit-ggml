@@ -30,6 +30,11 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
+        // TQ2_0 is handled out-of-band by ggml_cuda_op_mul_mat_vec_tq2_0_q8_1
+        // (halo ternary GEMV in rocm-cpp). It does not fit the vecdotq
+        // shape (stride-32 weight packing, per-block fp16 scale) so it
+        // is intercepted before reaching mul_mat_vec_q_switch_type.
+        case GGML_TYPE_TQ2_0:   return nullptr;
         default:                return nullptr;
     }
 }
@@ -745,6 +750,21 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+
+    // Halo TQ2_0 fast path: single-token (ne11==1) decode on HIP. The
+    // halo kernel does its own Q8_1 quantisation internally, so we
+    // divert here before the pool alloc. Multi-token prefill and
+    // MUL_MAT_ID fall through to the generic path, which will abort in
+    // mul_mat_vec_q_switch_type — device_supports_op is expected to
+    // have gated that case out upstream.
+    if (src0->type == GGML_TYPE_TQ2_0 && !ids &&
+            ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1) {
+        GGML_ASSERT(fusion == nullptr &&
+                    "TQ2_0 HIP GEMV does not yet support the fused mul_mat path");
+        ggml_cuda_op_mul_mat_vec_tq2_0_q8_1(ctx, src0, src1, dst);
+        return;
+    }
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
