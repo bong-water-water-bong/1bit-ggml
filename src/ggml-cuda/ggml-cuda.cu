@@ -4717,6 +4717,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                         return true;
+                    case GGML_TYPE_TQ2_0:
+                        // Halo HIP-only ternary GEMV fast path. Single-
+                        // token decode only: ne11==1, no batching, no
+                        // MUL_MAT_ID. Prefill and multi-token paths
+                        // remain on the CPU reference in ggml.c.
+#if defined(GGML_USE_HIP)
+                        return op->op == GGML_OP_MUL_MAT &&
+                               b->type == GGML_TYPE_F32 &&
+                               b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1 &&
+                               a->ne[2] == 1 && a->ne[3] == 1 &&
+                               (a->ne[0] % 256) == 0;
+#else
+                        return false;
+#endif
                     default:
                         return false;
                 }
