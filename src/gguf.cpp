@@ -607,25 +607,60 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
         {
             uint32_t n_dims = 0;
             ok = ok && gr.read(n_dims);
+
+            // 1bit-ggml extension: models that embed higher-rank tensors
+            // (e.g. Wan 2.2 TI2V-5B's 5D patch_embedding for spatiotemporal
+            // video patches) don't fit in ggml's 4D tensor model. Rather
+            // than hard-fail the load, collapse trailing dimensions into
+            // the last 4D slot so the loader can still read the bytes in
+            // one shot; the consumer is responsible for reshaping back to
+            // the original rank at kernel-dispatch time. Log the collapse
+            // so debugging stays honest.
+            uint32_t collapsed_from = 0;
             if (n_dims > GGML_MAX_DIMS) {
-                GGML_LOG_ERROR("%s: tensor '%s' has invalid number of dimensions: %" PRIu32 " > %" PRIu32 "\n",
-                    __func__, info.t.name, n_dims, GGML_MAX_DIMS);
-                ok = false;
-                break;
+                collapsed_from = n_dims;
+                GGML_LOG_WARN("%s: tensor '%s' has %" PRIu32 " dimensions (> GGML_MAX_DIMS=%" PRIu32 "); collapsing trailing dims into ne[%d] — consumer must reshape\n",
+                    __func__, info.t.name, n_dims, GGML_MAX_DIMS, GGML_MAX_DIMS - 1);
             }
+
+            // Read the first (GGML_MAX_DIMS - 1) dims verbatim. Any extra
+            // dims beyond that fold into the last slot via multiplication.
             for (uint32_t j = 0; ok && j < GGML_MAX_DIMS; ++j) {
                 info.t.ne[j] = 1;
-                if (j < n_dims) {
+                if (j < n_dims && j < static_cast<uint32_t>(GGML_MAX_DIMS) - 1) {
                     ok = ok && gr.read(info.t.ne[j]);
+                } else if (j == static_cast<uint32_t>(GGML_MAX_DIMS) - 1) {
+                    // Last slot: if the source has this dim, read it; then
+                    // multiply in every additional trailing dim.
+                    if (j < n_dims) {
+                        ok = ok && gr.read(info.t.ne[j]);
+                    }
+                    for (uint32_t k = GGML_MAX_DIMS; ok && k < n_dims; ++k) {
+                        int64_t extra = 1;
+                        ok = ok && gr.read(extra);
+                        if (ok && extra > 0 && info.t.ne[j] > 0 &&
+                            INT64_MAX / extra <= info.t.ne[j]) {
+                            GGML_LOG_ERROR("%s: tensor '%s' collapsed dim product overflows int64\n",
+                                __func__, info.t.name);
+                            ok = false;
+                            break;
+                        }
+                        info.t.ne[j] *= extra;
+                    }
                 }
 
                 // check that all ne are non-negative
-                if (info.t.ne[j] < 0) {
+                if (ok && info.t.ne[j] < 0) {
                     GGML_LOG_ERROR("%s: tensor '%s' dimension %" PRIu32 " has invalid number of elements: %" PRIi64 " < 0\n",
                         __func__, info.t.name, j, info.t.ne[j]);
                     ok = false;
                     break;
                 }
+            }
+
+            if (ok && collapsed_from) {
+                GGML_LOG_INFO("%s: tensor '%s' collapsed from %" PRIu32 "D to %dD, last dim now %" PRId64 "\n",
+                    __func__, info.t.name, collapsed_from, GGML_MAX_DIMS, info.t.ne[GGML_MAX_DIMS - 1]);
             }
 
             // check that the total number of elements is representable
